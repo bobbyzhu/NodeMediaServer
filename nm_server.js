@@ -33,21 +33,25 @@ function NMServer() {
             conn.run();
             console.info("pub:" + conn.publishStreamName);
             if (conn.publishStreamName != null) {
-                console.info("Delete publiser from producers. Stream name " + conn.publishStreamName);
 
-                $.producers.delete(conn.publishStreamName);
+
                 console.info("Send Stream EOF to publiser's consumers. Stream name " + conn.publishStreamName);
-                conn.consumers.forEach(function(value, key) {
+                $.producers.get(conn.publishStreamName).consumers.forEach(function(value, key) {
+                    value.sendMessageQueue.put(null);
                     value.sendStreamEOF();
                     value.socket.close();
                 });
+
+                console.info("Delete publiser from producers. Stream name " + conn.publishStreamName);
+                $.producers.delete(conn.publishStreamName);
+
             }
 
             console.info("play:" + conn.playStreamName);
             if (conn.playStreamName != null) {
                 if ($.producers.has(conn.playStreamName)) {
                     console.info("Delete player from consumers. Stream name " + conn.playStreamName);
-                    $.conns.get($.producers.get(conn.playStreamName)).consumers.delete(conn.id);
+                    $.producers.get(conn.playStreamName).consumers.delete(conn.id);
                 }
 
             }

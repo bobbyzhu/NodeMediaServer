@@ -60,10 +60,12 @@ function NMConnection(id, client, conns, producers) {
 
     this.publishStreamName = null;
     this.PlayStreamName = null;
-    this.consumers = new Map();
 
     this.cacheAudioSequenceBuffer = new Buffer();
     this.cacheVideoSequenceBuffer = new Buffer();
+
+    this.sendMessageQueue = new coroutine.BlockQueue(100);
+    this.isReadyToPlay = false;
 
     NMConnection.prototype.run = function() {
         console.log('[NSConnection] run');
@@ -118,7 +120,6 @@ function NMConnection(id, client, conns, producers) {
                 bufs.write(rtmpBody.slice(0, bodyLength));
                 bodyLength -= bodyLength;
             }
-
         } while (bodyLength > 0)
 
         return bufs;
@@ -336,19 +337,26 @@ function NMConnection(id, client, conns, producers) {
                 var streamName = this.connectCmdObj.app + '/' + cmd.streamName;
                 console.debug("[rtmp streamPlay] Client want to play:" + streamName);
                 this.respondPlay();
+                this.playStreamName = streamName;
 
-                if (this.producers.has(streamName)) {
-                    console.debug("[rtmp streamPlay]  There's a stream named " + streamName + " is publushing! id=" + this.producers.get(streamName));
-                    this.playStreamName = streamName;
-                    var producer = this.conns.get(this.producers.get(streamName));
-                    this.cacheAudioSequenceBuffer = producer.cacheAudioSequenceBuffer;
-                    this.cacheVideoSequenceBuffer = producer.cacheVideoSequenceBuffer;
-                    producer.consumers.set(this.id, this);
-                    this.startPlay(producer);
+                if (!this.producers.has(streamName)) {
+                    console.debug("[rtmp streamPlay]  There's no stream named " + streamName + " is publushing! Create a producer.");
+                    this.producers.set(streamName, {
+                        id: null,
+                        consumers: new Map()
+                    });
+                } else if (this.producers.get(streamName).id == null) {
+                    console.debug("[rtmp streamPlay]  There's no stream named " + streamName + " is publushing! But the producer is created.");
                 } else {
-                    console.debug("[rtmp streamPlay]  There's no stream named " + streamName + " is publushing!");
+                    console.debug("[rtmp streamPlay]  There's a stream named " + streamName + " is publushing! id=" + this.producers.get(streamName).id);
+                    this.isReadyToPlay = true;
                 }
-
+                this.producers.get(streamName).consumers.set(this.id, this);
+                var rtmpMessage = new Buffer("020000000000060400000000000000000001", 'hex');
+                this.sendMessageQueue.offer(rtmpMessage);
+                if (this.isReadyToPlay) {
+                    this.startPlay(this.conns.get(this.producers.get(streamName).id));
+                }
                 break;
             case 'closeStream':
                 this.closeStream();
@@ -369,14 +377,21 @@ function NMConnection(id, client, conns, producers) {
             case 'publish':
                 var streamName = this.connectCmdObj.app + '/' + cmd.name;
                 console.debug("[rtmp publish] A client want to publish a stream named " + streamName);
-                if (this.producers.has(streamName)) {
+                this.publishStreamName = streamName;
+                if (!this.producers.has(streamName)) {
+                    this.producers.set(streamName, {
+                        id: this.id,
+                        consumers: new Map()
+                    });
+                } else if (this.producers.get(streamName).id == null) {
+                    this.producers.get(streamName).id = this.id;
+                } else {
                     console.warn("[rtmp publish] Already has a stream named " + streamName);
                     this.respondPublishError();
-                } else {
-                    this.publishStreamName = streamName;
-                    this.producers.set(streamName, this.id);
-                    this.respondPublish();
+                    return;
                 }
+                this.consumers = this.producers.get(streamName).consumers;
+                this.respondPublish();
                 break;
             case 'FCUnpublish':
                 this.respondFCUnpublish();
@@ -487,7 +502,7 @@ function NMConnection(id, client, conns, producers) {
 
     };
 
-    NMConnection.prototype.respondPlay = function(producer) {
+    NMConnection.prototype.respondPlay = function() {
         var rtmpHeader = {
             chunkStreamID: 3,
             timestamp: 0,
@@ -526,27 +541,43 @@ function NMConnection(id, client, conns, producers) {
     };
 
     NMConnection.prototype.startPlay = function(producer) {
-        var rtmpMessage = new Buffer("020000000000060400000000000000000001", 'hex');
 
-        this.socket.write(rtmpMessage);
+        if (producer.metaData != null) {
+            var rtmpHeader = {
+                chunkStreamID: 5,
+                timestamp: 0,
+                messageTypeID: 0x12,
+                messageStreamID: 1
+            };
+
+            var opt = {
+                cmd: 'onMetaData',
+                cmdObj: producer.metaData
+            };
+
+            var rtmpBody = AMF.encodeAmf0Cmd(opt);
+            var rtmpMessage = this.createRtmpMessage(rtmpHeader, rtmpBody);
+            this.sendMessageQueue.offer(rtmpMessage);
+        }
 
         var rtmpHeader = {
-            chunkStreamID: 5,
+            chunkStreamID: 4,
             timestamp: 0,
-            messageTypeID: 0x12,
+            messageTypeID: 0x08,
             messageStreamID: 1
         };
-        var opt = {
-            cmd: 'onMetaData',
-            cmdObj: producer.metaData
+        var rtmpMessage = this.createRtmpMessage(rtmpHeader, producer.cacheAudioSequenceBuffer);
+        this.sendMessageQueue.offer(rtmpMessage);
+
+        var rtmpHeader = {
+            chunkStreamID: 4,
+            timestamp: 0,
+            messageTypeID: 0x09,
+            messageStreamID: 1
         };
-
-        var rtmpBody = AMF.encodeAmf0Cmd(opt);
-        var rtmpMessage = this.createRtmpMessage(rtmpHeader, rtmpBody);
-        this.socket.write(rtmpMessage);
-
-        this.sendAudioRtmpMessage(0, this.cacheAudioSequenceBuffer);
-        this.sendVideoRtmpMessage(0, this.cacheVideoSequenceBuffer);
+        var rtmpMessage = this.createRtmpMessage(rtmpHeader, producer.cacheVideoSequenceBuffer);
+        this.sendMessageQueue.offer(rtmpMessage);
+        this.doSendRtmpMessage.start(this);
     };
 
     NMConnection.prototype.closeStream = function() {
@@ -620,8 +651,30 @@ function NMConnection(id, client, conns, producers) {
 
     NMConnection.prototype.receiveSetDataFrame = function(method, obj) {
         console.log('[receiveSetDataFrame] method:' + method);
-        // console.log(obj);
         this.metaData = obj;
+
+        var rtmpHeader = {
+            chunkStreamID: 5,
+            timestamp: 0,
+            messageTypeID: 0x12,
+            messageStreamID: 1
+        };
+        var opt = {
+            cmd: 'onMetaData',
+            cmdObj: obj
+        };
+
+        var rtmpBody = AMF.encodeAmf0Cmd(opt);
+        var rtmpMessage = this.createRtmpMessage(rtmpHeader, rtmpBody);
+
+        this.consumers.forEach(function(conn, id) {
+            if (!conn.isReadyToPlay) {
+                conn.doSendRtmpMessage.start(conn);
+                conn.isReadyToPlay = true;
+            }
+            console.log("on metadata put onMetadata to queue:");
+            conn.sendMessageQueue.offer(rtmpMessage);
+        });
     };
 
     NMConnection.prototype.createUserControlMessage = function(rtmpHeader, rtmpBody) {
@@ -708,12 +761,34 @@ function NMConnection(id, client, conns, producers) {
                 // console.debug(this.codec);
                 this.isFirstAudioReceived = false;
                 this.cacheAudioSequenceBuffer.write(rtmpBody);
+                var sendRtmpHeader = {
+                    chunkStreamID: 4,
+                    timestamp: 0,
+                    messageTypeID: 0x08,
+                    messageStreamID: 1
+                };
+                var rtmpMessage = this.createRtmpMessage(sendRtmpHeader, rtmpBody);
+                this.consumers.forEach(function(conn, id) {
+                    if (!conn.isReadyToPlay) {
+                        conn.doSendRtmpMessage.start(conn);
+                        conn.isReadyToPlay = true;
+                    }
+                    conn.sendMessageQueue.offer(rtmpMessage);
+                });
             }
 
         } else {
-            this.consumers.forEach(function(value, key) {
-                value.sendAudioRtmpMessage(rtmpHeader.timestamp, rtmpBody);
+            var sendRtmpHeader = {
+                chunkStreamID: 4,
+                timestamp: rtmpHeader.timestamp,
+                messageTypeID: 0x08,
+                messageStreamID: 1
+            };
+            var rtmpMessage = this.createRtmpMessage(sendRtmpHeader, rtmpBody);
+            this.consumers.forEach(function(conn, id) {
+                conn.sendMessageQueue.offer(rtmpMessage);
             });
+
             /* 
             var frame_length = rtmpBody.length - 2 + 7;
             var audioBuffer = new Buffer(frame_length);
@@ -803,10 +878,32 @@ function NMConnection(id, client, conns, producers) {
                 // console.info('sps: ' + this.codec.sps.hex());
                 // console.info('pps: ' + this.codec.pps.hex());
                 this.cacheVideoSequenceBuffer.write(rtmpBody);
+
+                var sendRtmpHeader = {
+                    chunkStreamID: 4,
+                    timestamp: 0,
+                    messageTypeID: 0x09,
+                    messageStreamID: 1
+                };
+                var rtmpMessage = this.createRtmpMessage(sendRtmpHeader, rtmpBody);
+                this.consumers.forEach(function(conn, id) {
+                    if (!conn.isReadyToPlay) {
+                        conn.doSendRtmpMessage.start(conn);
+                        conn.isReadyToPlay = true;
+                    }
+                    conn.sendMessageQueue.offer(rtmpMessage);
+                });
             }
         } else if (avc_packet_type == 1) {
-            this.consumers.forEach(function(value, key) {
-                value.sendVideoRtmpMessage(rtmpHeader.timestamp, rtmpBody);
+            var sendRtmpHeader = {
+                chunkStreamID: 4,
+                timestamp: rtmpHeader.timestamp,
+                messageTypeID: 0x09,
+                messageStreamID: 1
+            };
+            var rtmpMessage = this.createRtmpMessage(sendRtmpHeader, rtmpBody);
+            this.consumers.forEach(function(conn, id) {
+                conn.sendMessageQueue.offer(rtmpMessage);
             });
             /*
             //AVC NALU
@@ -843,51 +940,26 @@ function NMConnection(id, client, conns, producers) {
         }
     };
 
-    NMConnection.prototype.sendAudioRtmpMessage = function(timestamp, rtmpBody) {
-        if (this.isStarting) {
-            var rtmpHeader = {
-                chunkStreamID: 4,
-                timestamp: timestamp,
-                messageTypeID: 0x08,
-                messageStreamID: 1
-            };
-            var rtmpMessage = this.createRtmpMessage(rtmpHeader, rtmpBody);
-            try {
-                this.socket.write(rtmpMessage);
-            } catch (e) {
-                console.warn("sendAudioRtmpMessage :" + e);
-                this.isStarting = false;
+    NMConnection.prototype.sendStreamEOF = function() {
+        var rtmpBuffer = new Buffer("020000000000060400000000000100000001", 'hex');
+        this.socket.write(rtmpBuffer);
+    };
+
+    NMConnection.prototype.doSendRtmpMessage = function(_this) {
+        console.log("doSendRtmpMessage is stating! id:" + _this.id);
+        while (_this.isStarting) {
+            var rtmpMessage = _this.sendMessageQueue.take();
+            if (rtmpMessage == null) {
+                break;
             }
-            this.lastAudioTimestamp = timestamp;
-        }
-
-    };
-
-    NMConnection.prototype.sendVideoRtmpMessage = function(timestamp, rtmpBody) {
-        if (this.isStarting) {
-            var rtmpHeader = {
-                chunkStreamID: 4,
-                timestamp: timestamp,
-                messageTypeID: 0x09,
-                messageStreamID: 1
-            };
-            var rtmpMessage = this.createRtmpMessage(rtmpHeader, rtmpBody);
             try {
-                this.socket.write(rtmpMessage);
+                _this.socket.write(rtmpMessage);
             } catch (e) {
-                console.warn("sendVideoRtmpMessage :" + e);
-                this.isStarting = false;
+                console.warn('doSendRtmpMessage:' + e);
             }
-
-            this.lastVideoTimestamp = timestamp;
         }
+        console.log("doSendRtmpMessage is stop! id:" + _this.id);
     };
-
-    NMConnection.prototype.sendStreamEOF  = function() {
-       var rtmpBuffer = new Buffer("020000000000060400000000000100000001",'hex');
-       this.socket.write(rtmpBuffer);
-    };
-
 }
 
 module.exports = NMConnection;
